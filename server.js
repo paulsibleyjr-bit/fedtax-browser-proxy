@@ -1,13 +1,8 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
-/**
- * Render expects an HTTP server to bind to PORT.
- * WebSocket upgrades happen on this same server.
- */
 const PORT = process.env.PORT || 10000;
 
-// ENV
 const UPSTREAM_WS_URL = process.env.UPSTREAM_WS_URL || "wss://chrome.browserless.io";
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 
@@ -18,12 +13,10 @@ const server = http.createServer((req, res) => {
     res.end("ok");
     return;
   }
-
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("ok");
 });
 
-// Disable permessage-deflate to avoid RSV1/permessage-deflate issues
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
@@ -42,7 +35,7 @@ function buildUpstreamWsUrl() {
 
   const upstream = new URL(UPSTREAM_WS_URL);
 
-  // If token is required and not already present, add it.
+  // Add token if missing
   if (BROWSERLESS_TOKEN && !upstream.searchParams.get("token")) {
     upstream.searchParams.set("token", BROWSERLESS_TOKEN);
   }
@@ -54,8 +47,6 @@ server.on("upgrade", async (request, socket, head) => {
   try {
     console.log("[UPGRADE] request.url =", request.url);
 
-    // Parse query params from the websocket URL the browser used:
-    // wss://fedtax-browser-proxy.onrender.com/?sessionId=...&proxySecret=...
     const url = new URL(request.url, "http://localhost");
     const sessionId = url.searchParams.get("sessionId");
     const proxySecret = url.searchParams.get("proxySecret");
@@ -69,10 +60,9 @@ server.on("upgrade", async (request, socket, head) => {
       return;
     }
 
-    // ✅ OPTION A (recommended): TEMPORARILY SKIP VERIFICATION ENTIRELY
+    // ✅ OPTION A: Skip verification for now
     console.log("[UPGRADE] verification skipped (OPTION A)");
 
-    // Accept the WS upgrade
     wss.handleUpgrade(request, socket, head, (clientWs) => {
       wss.emit("connection", clientWs, request);
     });
@@ -101,9 +91,7 @@ wss.on("connection", (clientWs) => {
   if (upstreamUrl) {
     console.log("[UPSTREAM] connecting to:", upstreamUrl);
 
-    upstreamWs = new WebSocket(upstreamUrl, {
-      perMessageDeflate: false,
-    });
+    upstreamWs = new WebSocket(upstreamUrl, { perMessageDeflate: false });
 
     upstreamWs.on("open", () => {
       console.log("[UPSTREAM] connected");
@@ -113,21 +101,13 @@ wss.on("connection", (clientWs) => {
     });
 
     upstreamWs.on("message", (data) => {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(data);
-      }
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
     });
 
     upstreamWs.on("close", (code, reason) => {
       console.log("[UPSTREAM] closed", code, reason?.toString?.() || "");
       if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(
-          safeLog({
-            type: "proxy_error",
-            message: "Upstream disconnected",
-            code,
-          })
-        );
+        clientWs.send(safeLog({ type: "proxy_error", message: "Upstream disconnected", code }));
       }
     });
 
@@ -144,7 +124,6 @@ wss.on("connection", (clientWs) => {
     });
   }
 
-  // Forward client -> upstream
   clientWs.on("message", (data) => {
     if (!upstreamWs || upstreamWs.readyState !== WebSocket.OPEN) {
       if (clientWs.readyState === WebSocket.OPEN) {
@@ -159,7 +138,6 @@ wss.on("connection", (clientWs) => {
       }
       return;
     }
-
     upstreamWs.send(data);
   });
 
