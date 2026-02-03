@@ -1,136 +1,97 @@
-// server.js (Render) - WebSocket proxy for Browserless + Base44 verification (proxySecret auth)
+import http from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import fetch from "node-fetch";
 
-const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
+const PORT = process.env.PORT || 10000;
 
-// Node 18+ has global fetch. Render uses Node 18+ by default.
-const fetchFn = global.fetch;
+const server = http.createServer();
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+/**
+ * WebSocket server
+ * IMPORTANT:
+ * - noServer: true (we manually handle upgrades)
+ * - perMessageDeflate: false (FIXES RSV1 ERROR)
+ */
+const wss = new WebSocketServer({
+  noServer: true,
+  perMessageDeflate: false,
+});
 
-const {
-  BROWSERLESS_TOKEN,
-  BROWSERLESS_WS_ENDPOINT = "wss://chrome.browserless.io",
-  BASE44_API_URL = "https://base44.app",
-  BASE44_APP_ID,
-} = process.env;
-
-if (!BROWSERLESS_TOKEN) {
-  console.error("Missing env var: BROWSERLESS_TOKEN");
-}
-if (!BASE44_APP_ID) {
-  console.error("Missing env var: BASE44_APP_ID");
-}
-
-app.get("/health", (_, res) => res.json({ status: "ok" }));
-
-function getWsParams(reqUrl) {
-  const params = new URL(reqUrl, "ws://localhost").searchParams;
-  return {
-    sessionId: params.get("sessionId"),
-    proxySecret: params.get("proxySecret"),
-  };
-}
-
-async function verifySession({ sessionId, proxySecret }) {
-  const verifyUrl =
-    `${BASE44_API_URL}/api/apps/${BASE44_APP_ID}/functions/verifyBrowserSession` +
-    `?sessionId=${encodeURIComponent(sessionId)}` +
-    `&proxySecret=${encodeURIComponent(proxySecret)}`;
-
-  const res = await fetchFn(verifyUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Session-Id": sessionId,
-      "X-Proxy-Secret": proxySecret,
-    },
-    body: JSON.stringify({ sessionId, proxySecret }),
-  });
-
-  const text = await res.text();
-  return { ok: res.ok, status: res.status, text };
-}
-
-wss.on("connection", async (clientSocket, req) => {
+/**
+ * Handle WebSocket upgrade
+ * THIS IS THE ONLY PLACE query params exist
+ */
+server.on("upgrade", async (request, socket, head) => {
   try {
-    const { sessionId, proxySecret } = getWsParams(req.url);
+    const url = new URL(request.url, "http://localhost");
+    const sessionId = url.searchParams.get("sessionId");
+    const proxySecret = url.searchParams.get("proxySecret");
 
     if (!sessionId || !proxySecret) {
-      clientSocket.send(
-        JSON.stringify({
-          type: "error",
-          message: "Missing sessionId or proxySecret",
-        })
-      );
-      clientSocket.close();
+      socket.write("HTTP/1.1 400 Bad Request\r\n\r\nMissing sessionId/proxySecret");
+      socket.destroy();
       return;
     }
 
-    // 1) Verify with Base44 using proxySecret (no user auth token needed)
-    const verify = await verifySession({ sessionId, proxySecret });
-    if (!verify.ok) {
-      console.error("[WS Proxy] verifyBrowserSession failed:", verify.status, verify.text);
-      clientSocket.send(
-        JSON.stringify({
-          type: "error",
-          message: "Invalid or expired browser session",
-        })
-      );
-      clientSocket.close();
-      return;
-    }
-
-    // 2) Connect to browserless (Chrome DevTools Protocol WS)
-    const browserlessUrl =
-      `${BROWSERLESS_WS_ENDPOINT}?token=${encodeURIComponent(BROWSERLESS_TOKEN)}` +
-      `&stealth=true&blockAds=true`;
-
-    const browserSocket = new WebSocket(browserlessUrl);
-
-    browserSocket.on("open", () => {
-      clientSocket.send(JSON.stringify({ type: "ready" }));
-    });
-
-    // Pipe binary/text messages both ways
-    browserSocket.on("message", (data) => {
-      if (clientSocket.readyState === WebSocket.OPEN) clientSocket.send(data);
-    });
-
-    clientSocket.on("message", (data) => {
-      if (browserSocket.readyState === WebSocket.OPEN) browserSocket.send(data);
-    });
-
-    browserSocket.on("close", () => {
-      if (clientSocket.readyState === WebSocket.OPEN) clientSocket.close();
-    });
-
-    browserSocket.on("error", (err) => {
-      console.error("[WS Proxy] browserless error:", err?.message || err);
-      if (clientSocket.readyState === WebSocket.OPEN) {
-        clientSocket.send(JSON.stringify({ type: "error", message: "Browserless connection error" }));
-        clientSocket.close();
+    // Verify session with Base44 using JSON body
+    const verifyResponse = await fetch(
+      "https://api.base44.com/apps/696febb1921e5c4ec6bce8d3/functions/verifyBrowserSession",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, proxySecret }),
       }
-    });
+    );
 
-    clientSocket.on("close", () => {
-      if (browserSocket.readyState === WebSocket.OPEN) browserSocket.close();
+    if (!verifyResponse.ok) {
+      const err = await verifyResponse.text();
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n" + err);
+      socket.destroy();
+      return;
+    }
+
+    // Accept WebSocket connection
+    wss.handleUpgrade(request, socket, head, (clientWs) => {
+      clientWs.sessionId = sessionId;
+      wss.emit("connection", clientWs);
     });
   } catch (err) {
-    console.error("[WS Proxy] connection handler error:", err?.message || err);
-    try {
-      clientSocket.send(JSON.stringify({ type: "error", message: "Proxy error" }));
-    } catch {}
-    try {
-      clientSocket.close();
-    } catch {}
+    socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n" + err.message);
+    socket.destroy();
   }
 });
 
-const PORT = process.env.PORT || 8080;
+/**
+ * When client WS is connected, proxy to browserless
+ */
+wss.on("connection", (clientWs) => {
+  const browserlessUrl = process.env.BROWSERLESS_WS_URL;
+
+  if (!browserlessUrl) {
+    clientWs.close(1011, "Browserless URL not configured");
+    return;
+  }
+
+  const upstreamWs = new WebSocket(browserlessUrl, {
+    perMessageDeflate: false, // FIX RSV1
+  });
+
+  clientWs.on("message", (msg) => {
+    if (upstreamWs.readyState === WebSocket.OPEN) {
+      upstreamWs.send(msg);
+    }
+  });
+
+  upstreamWs.on("message", (msg) => {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(msg);
+    }
+  });
+
+  clientWs.on("close", () => upstreamWs.close());
+  upstreamWs.on("close", () => clientWs.close());
+});
+
 server.listen(PORT, () => {
-  console.log(`Proxy listening on ${PORT}`);
+  console.log(`Browser proxy listening on ${PORT}`);
 });
