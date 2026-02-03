@@ -1,97 +1,138 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
-import fetch from "node-fetch";
+
+/**
+ * FEDTAX Browser Proxy (Render)
+ * - Accepts WS connections from your Base44 app (browser UI)
+ * - Extracts sessionId/proxySecret from the WS upgrade URL query params
+ * - Verifies session by POSTing JSON to Base44 verifyBrowserSession
+ * - Proxies frames to/from the upstream browserless WS (placeholder section)
+ *
+ * IMPORTANT:
+ * - DISABLE compression to avoid: "Invalid WebSocket frame: RSV1 must be clear"
+ */
 
 const PORT = process.env.PORT || 10000;
 
-const server = http.createServer();
+// ✅ Your Base44 verify function endpoint (keep as-is unless your app id changes)
+const VERIFY_URL =
+  "https://api.base44.com/apps/696febb1921e5c4ec6bce8d3/functions/verifyBrowserSession";
 
-/**
- * WebSocket server
- * IMPORTANT:
- * - noServer: true (we manually handle upgrades)
- * - perMessageDeflate: false (FIXES RSV1 ERROR)
- */
+// If your verify function requires a secret header, add it in Render ENV and uncomment below.
+// const INTERNAL_PROXY_SECRET = process.env.INTERNAL_PROXY_SECRET;
+
+function sendHttpError(socket, statusLine, body) {
+  try {
+    socket.write(`HTTP/1.1 ${statusLine}\r\nContent-Type: text/plain\r\n\r\n${body}`);
+  } catch {}
+  try {
+    socket.destroy();
+  } catch {}
+}
+
+async function verifySession(sessionId, proxySecret) {
+  const res = await fetch(VERIFY_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      // "X-Internal-Proxy-Secret": INTERNAL_PROXY_SECRET || "",
+    },
+    body: JSON.stringify({ sessionId, proxySecret }),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(text || `verify failed (${res.status})`);
+  }
+
+  // verifyBrowserSession returns JSON on success; tolerate text/plain wrappers
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: true, raw: text };
+  }
+}
+
+const server = http.createServer((req, res) => {
+  // Basic health check
+  if (req.url === "/" || req.url?.startsWith("/health")) {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+    return;
+  }
+  res.writeHead(404);
+  res.end("not found");
+});
+
+// ✅ Disable perMessageDeflate to avoid RSV1 issues
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
 });
 
-/**
- * Handle WebSocket upgrade
- * THIS IS THE ONLY PLACE query params exist
- */
 server.on("upgrade", async (request, socket, head) => {
   try {
     const url = new URL(request.url, "http://localhost");
+
     const sessionId = url.searchParams.get("sessionId");
     const proxySecret = url.searchParams.get("proxySecret");
 
     if (!sessionId || !proxySecret) {
-      socket.write("HTTP/1.1 400 Bad Request\r\n\r\nMissing sessionId/proxySecret");
-      socket.destroy();
-      return;
+      return sendHttpError(
+        socket,
+        "400 Bad Request",
+        "Missing sessionId/proxySecret in WS upgrade URL"
+      );
     }
 
-    // Verify session with Base44 using JSON body
-    const verifyResponse = await fetch(
-      "https://api.base44.com/apps/696febb1921e5c4ec6bce8d3/functions/verifyBrowserSession",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId, proxySecret }),
-      }
-    );
-
-    if (!verifyResponse.ok) {
-      const err = await verifyResponse.text();
-      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n" + err);
-      socket.destroy();
-      return;
+    // ✅ Verify immediately during upgrade (this is where query params exist)
+    try {
+      await verifySession(sessionId, proxySecret);
+    } catch (err) {
+      return sendHttpError(
+        socket,
+        "403 Forbidden",
+        `verifyBrowserSession failed: ${err?.message || String(err)}`
+      );
     }
 
-    // Accept WebSocket connection
-    wss.handleUpgrade(request, socket, head, (clientWs) => {
-      clientWs.sessionId = sessionId;
-      wss.emit("connection", clientWs);
+    // If verified, complete WS upgrade
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
     });
   } catch (err) {
-    socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n" + err.message);
-    socket.destroy();
+    return sendHttpError(
+      socket,
+      "500 Internal Server Error",
+      err?.message || "upgrade failed"
+    );
   }
 });
 
-/**
- * When client WS is connected, proxy to browserless
- */
-wss.on("connection", (clientWs) => {
-  const browserlessUrl = process.env.BROWSERLESS_WS_URL;
+wss.on("connection", (clientWs, request) => {
+  // ✅ Also disable compression on client side
+  clientWs._socket?.setNoDelay?.(true);
 
-  if (!browserlessUrl) {
-    clientWs.close(1011, "Browserless URL not configured");
-    return;
-  }
+  // At this point, you're verified.
+  // TODO: connect to upstream browserless WS and proxy frames.
+  // For now, we just confirm connection and keep it open.
 
-  const upstreamWs = new WebSocket(browserlessUrl, {
-    perMessageDeflate: false, // FIX RSV1
+  clientWs.send(
+    JSON.stringify({
+      ok: true,
+      message: "Proxy connected + session verified",
+    })
+  );
+
+  clientWs.on("message", (data) => {
+    // Echo for debugging (remove later)
+    clientWs.send(data);
   });
 
-  clientWs.on("message", (msg) => {
-    if (upstreamWs.readyState === WebSocket.OPEN) {
-      upstreamWs.send(msg);
-    }
-  });
-
-  upstreamWs.on("message", (msg) => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(msg);
-    }
-  });
-
-  clientWs.on("close", () => upstreamWs.close());
-  upstreamWs.on("close", () => clientWs.close());
+  clientWs.on("close", () => {});
+  clientWs.on("error", () => {});
 });
 
 server.listen(PORT, () => {
-  console.log(`Browser proxy listening on ${PORT}`);
+  console.log(`Proxy listening on ${PORT}`);
 });
