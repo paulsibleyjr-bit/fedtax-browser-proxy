@@ -1,7 +1,22 @@
 import http from "http";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT || 10000;
+
+/**
+ * REQUIRED ENV VAR:
+ * This must be the REAL upstream websocket endpoint that actually serves the browser.
+ * Ask Base44 what it is, or check your old proxy code.
+ *
+ * Example: wss://browser-provider.example.com/ws
+ */
+const UPSTREAM_WS_URL = process.env.UPSTREAM_WS_URL;
+
+if (!UPSTREAM_WS_URL) {
+  console.warn(
+    "[BOOT] Missing UPSTREAM_WS_URL env var. Proxy will verify but cannot connect upstream."
+  );
+}
 
 // HTTP server (Render requires this)
 const server = http.createServer((req, res) => {
@@ -9,7 +24,7 @@ const server = http.createServer((req, res) => {
   res.end("ok");
 });
 
-// IMPORTANT: disable permessage-deflate to avoid RSV1 errors
+// Disable permessage-deflate to avoid RSV1 errors
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
@@ -17,7 +32,6 @@ const wss = new WebSocketServer({
 
 server.on("upgrade", async (request, socket, head) => {
   try {
-    // 🔥 LOG EXACT URL WE GET
     console.log("[UPGRADE] request.url =", request.url);
 
     const url = new URL(request.url, "http://localhost");
@@ -33,7 +47,7 @@ server.on("upgrade", async (request, socket, head) => {
       return;
     }
 
-    // ✅ Verify with Base44 by JSON BODY (not query params)
+    // Verify session against Base44 (JSON body only)
     const verifyResponse = await fetch(
       "https://api.base44.com/apps/696febb1921e5c4ec6bce8d3/functions/verifyBrowserSession",
       {
@@ -44,39 +58,22 @@ server.on("upgrade", async (request, socket, head) => {
     );
 
     if (!verifyResponse.ok) {
-      const err = await verifyResponse.text();
-      console.log("[UPGRADE] verify failed:", err);
-      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n" + err);
+      const errText = await verifyResponse.text();
+      console.log("[UPGRADE] verify failed:", errText);
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n" + errText);
       socket.destroy();
       return;
     }
 
     console.log("[UPGRADE] verify OK");
 
-    // Upgrade accepted
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
+    // Accept upgrade
+    wss.handleUpgrade(request, socket, head, (clientWs) => {
+      wss.emit("connection", clientWs, request, { sessionId });
     });
   } catch (err) {
     console.error("[UPGRADE] error:", err);
     socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\nUpgrade error");
     socket.destroy();
   }
-});
-
-// Basic WS passthrough (placeholder)
-wss.on("connection", (ws) => {
-  console.log("[WS] connected");
-
-  ws.on("message", (msg) => {
-    // echo for now; replace with your actual proxying logic
-    ws.send(msg);
-  });
-
-  ws.on("close", () => console.log("[WS] closed"));
-  ws.on("error", (e) => console.log("[WS] error", e?.message || e));
-});
-
-server.listen(PORT, () => {
-  console.log("Proxy listening on", PORT);
 });
