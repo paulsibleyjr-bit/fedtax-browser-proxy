@@ -1,7 +1,7 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
-const BUILD = "proxy-v6-2026-02-03-1515";
+const BUILD = "proxy-v7-2026-02-03-1520";
 const PORT = process.env.PORT || 10000;
 
 const UPSTREAM_WS_URL = process.env.UPSTREAM_WS_URL || "wss://chrome.browserless.io/";
@@ -17,21 +17,23 @@ const server = http.createServer((req, res) => {
   res.end("ok");
 });
 
-// IMPORTANT: disable compression on the server-side WS listener too
+// Allow permessage-deflate (so RSV1 frames are legal)
 const wss = new WebSocketServer({
   noServer: true,
-  perMessageDeflate: false,
+  perMessageDeflate: {
+    threshold: 0,
+    serverNoContextTakeover: true,
+    clientNoContextTakeover: true,
+  },
 });
 
 function buildUpstreamUrl() {
   const u = new URL(UPSTREAM_WS_URL);
 
-  // Ensure token included
   if (BROWSERLESS_TOKEN && !u.searchParams.get("token")) {
     u.searchParams.set("token", BROWSERLESS_TOKEN);
   }
 
-  // Ensure pathname exists
   if (!u.pathname || u.pathname === "") u.pathname = "/";
 
   return u.toString();
@@ -68,7 +70,7 @@ server.on("upgrade", (request, socket, head) => {
 wss.on("connection", (clientWs, request) => {
   console.log(`[BOOT ${BUILD}] [WS] client connected`);
 
-  // Pass through any subprotocols the browser requested
+  // Pass through any subprotocols from the browser
   const protoHeader = request?.headers?.["sec-websocket-protocol"];
   const protocols = protoHeader
     ? protoHeader.split(",").map((p) => p.trim()).filter(Boolean)
@@ -79,24 +81,34 @@ wss.on("connection", (clientWs, request) => {
   }
 
   const upstreamUrl = buildUpstreamUrl();
-  console.log(`[BOOT ${BUILD}] [UPSTREAM] connecting to:`, upstreamUrl.replace(/token=[^&]+/g, "token=REDACTED"));
+  console.log(
+    `[BOOT ${BUILD}] [UPSTREAM] connecting to:`,
+    upstreamUrl.replace(/token=[^&]+/g, "token=REDACTED")
+  );
 
-  // Queue messages until upstream opens
   const queue = [];
-  const QUEUE_LIMIT = 1000;
+  const QUEUE_LIMIT = 2000;
 
-  // IMPORTANT: disable compression to upstream too (prevents RSV1 problems)
+  // Enable permessage-deflate to match Browserless (fixes RSV1)
   const upstreamWs = new WebSocket(upstreamUrl, protocols, {
-    perMessageDeflate: false,
+    perMessageDeflate: {
+      threshold: 0,
+      clientNoContextTakeover: true,
+      serverNoContextTakeover: true,
+    },
     maxPayload: 64 * 1024 * 1024,
   });
 
   let c2u = 0;
   let u2c = 0;
+  let sawClientMsg = false;
+  let sawUpstreamMsg = false;
 
+  // Keepalive pings (Browserless sometimes expects activity)
   const pingInterval = setInterval(() => {
     try {
       if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.ping();
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.ping();
     } catch {}
   }, 25000);
 
@@ -114,7 +126,8 @@ wss.on("connection", (clientWs, request) => {
 
   upstreamWs.on("message", (data) => {
     u2c++;
-    if (u2c === 1) {
+    if (!sawUpstreamMsg) {
+      sawUpstreamMsg = true;
       console.log(`[BOOT ${BUILD}] [FLOW] first upstream->client message received`);
     }
     if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
@@ -126,7 +139,7 @@ wss.on("connection", (clientWs, request) => {
       `[BOOT ${BUILD}] [UPSTREAM] closed`,
       code,
       reason?.toString?.() || "",
-      `c2u=${c2u} u2c=${u2c}`
+      `c2u=${c2u} u2c=${u2c} sawClientMsg=${sawClientMsg} sawUpstreamMsg=${sawUpstreamMsg}`
     );
     try {
       if (clientWs.readyState === WebSocket.OPEN) clientWs.close();
@@ -135,20 +148,28 @@ wss.on("connection", (clientWs, request) => {
 
   upstreamWs.on("error", (e) => {
     clearInterval(pingInterval);
-    console.log(`[BOOT ${BUILD}] [UPSTREAM] error`, e?.message || e, `c2u=${c2u} u2c=${u2c}`);
+    console.log(
+      `[BOOT ${BUILD}] [UPSTREAM] error`,
+      e?.message || e,
+      `c2u=${c2u} u2c=${u2c} sawClientMsg=${sawClientMsg} sawUpstreamMsg=${sawUpstreamMsg}`
+    );
     try {
       if (clientWs.readyState === WebSocket.OPEN) clientWs.close();
     } catch {}
   });
 
   clientWs.on("message", (data) => {
-    // Log whether Base44 is actually sending anything
-    if (c2u === 0) console.log(`[BOOT ${BUILD}] [FLOW] first client->upstream message received`);
+    if (!sawClientMsg) {
+      sawClientMsg = true;
+      console.log(`[BOOT ${BUILD}] [FLOW] first client->upstream message received`);
+    }
+
     if (upstreamWs.readyState === WebSocket.OPEN) {
       upstreamWs.send(data);
       c2u++;
       return;
     }
+
     if (queue.length < QUEUE_LIMIT) {
       queue.push(data);
     } else {
@@ -160,7 +181,10 @@ wss.on("connection", (clientWs, request) => {
   });
 
   clientWs.on("close", () => {
-    console.log(`[BOOT ${BUILD}] [WS] client closed`, `c2u=${c2u} u2c=${u2c}`);
+    console.log(
+      `[BOOT ${BUILD}] [WS] client closed`,
+      `c2u=${c2u} u2c=${u2c} sawClientMsg=${sawClientMsg} sawUpstreamMsg=${sawUpstreamMsg}`
+    );
     clearInterval(pingInterval);
     try {
       upstreamWs.close();
