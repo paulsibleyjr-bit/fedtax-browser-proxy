@@ -1,14 +1,13 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
-const BUILD = "proxy-v3-2026-02-03-1435"; // <-- used to confirm deploy
+const BUILD = "proxy-v4-2026-02-03-1450"; // confirms you're running the right deploy
 
 const PORT = process.env.PORT || 10000;
 
 const UPSTREAM_WS_URL = process.env.UPSTREAM_WS_URL || "wss://chrome.browserless.io";
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 
-// Render healthcheck
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "content-type": "text/plain" });
@@ -19,7 +18,7 @@ const server = http.createServer((req, res) => {
   res.end("ok");
 });
 
-// Browser -> Proxy compression OFF (Base44 client side)
+// Browser -> Proxy compression OFF (Base44 side)
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
@@ -40,9 +39,12 @@ function buildBrowserlessWsUrl() {
     u.searchParams.set("token", BROWSERLESS_TOKEN);
   }
 
-  // IMPORTANT: Browserless should be: wss://host?token=...
-  // URL() will default pathname to "/" so we intentionally omit pathname entirely:
-  return `${u.protocol}//${u.host}${u.search}`;
+  // Browserless commonly works with "/" but we keep it consistent and explicit:
+  // wss://host/?token=...  (safe)  OR wss://host?token=...
+  // We'll use "/" because that's what you've been seeing connect successfully.
+  const pathname = u.pathname && u.pathname !== "" ? u.pathname : "/";
+  const search = u.search || "";
+  return `${u.protocol}//${u.host}${pathname}${search}`;
 }
 
 server.on("upgrade", (request, socket, head) => {
@@ -53,8 +55,8 @@ server.on("upgrade", (request, socket, head) => {
     const sessionId = url.searchParams.get("sessionId");
     const proxySecret = url.searchParams.get("proxySecret");
 
-    console.log(`[UPGRADE] sessionId present =`, Boolean(sessionId));
-    console.log(`[UPGRADE] proxySecret present =`, Boolean(proxySecret));
+    console.log(`[BOOT ${BUILD}] [UPGRADE] sessionId present =`, Boolean(sessionId));
+    console.log(`[BOOT ${BUILD}] [UPGRADE] proxySecret present =`, Boolean(proxySecret));
 
     if (!sessionId || !proxySecret) {
       socket.write("HTTP/1.1 400 Bad Request\r\n\r\nMissing sessionId/proxySecret");
@@ -62,14 +64,14 @@ server.on("upgrade", (request, socket, head) => {
       return;
     }
 
-    // OPTION A: skip verification entirely
-    console.log("[UPGRADE] verification skipped (OPTION A)");
+    // OPTION A: skip verification
+    console.log(`[BOOT ${BUILD}] [UPGRADE] verification skipped (OPTION A)`);
 
     wss.handleUpgrade(request, socket, head, (clientWs) => {
       wss.emit("connection", clientWs, request);
     });
   } catch (err) {
-    console.error("[UPGRADE] error:", err?.message || err);
+    console.error(`[BOOT ${BUILD}] [UPGRADE] error:`, err?.message || err);
     socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\nUpgrade error");
     socket.destroy();
   }
@@ -81,30 +83,51 @@ wss.on("connection", (clientWs) => {
   const upstreamUrl = buildBrowserlessWsUrl();
   console.log(`[BOOT ${BUILD}] [UPSTREAM] connecting to:`, upstreamUrl);
 
-  // KEY FIX: enable permessage-deflate on upstream client
+  // Queue client->upstream messages until upstream is ready
+  const queue = [];
+  const QUEUE_LIMIT = 200; // prevents memory blowups
+
   const upstreamWs = new WebSocket(upstreamUrl, {
+    // IMPORTANT: allow permessage-deflate with browserless
     perMessageDeflate: true,
     maxPayload: 64 * 1024 * 1024,
   });
 
+  let upstreamOpen = false;
+
+  // Keepalive pings to reduce idle disconnects
   const pingInterval = setInterval(() => {
     try {
       if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.ping();
     } catch {}
   }, 25000);
 
+  function flushQueue() {
+    while (queue.length && upstreamWs.readyState === WebSocket.OPEN) {
+      upstreamWs.send(queue.shift());
+    }
+  }
+
   upstreamWs.on("open", () => {
+    upstreamOpen = true;
     console.log(`[BOOT ${BUILD}] [UPSTREAM] connected`);
+
     if (clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(safeJson({ type: "proxy_status", message: "Upstream connected" }));
     }
+
+    // Send any early CDP messages Base44 already sent
+    flushQueue();
   });
 
   upstreamWs.on("message", (data) => {
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(data);
+    }
   });
 
   upstreamWs.on("close", (code, reason) => {
+    upstreamOpen = false;
     clearInterval(pingInterval);
     console.log(`[BOOT ${BUILD}] [UPSTREAM] closed`, code, reason?.toString?.() || "");
     try {
@@ -113,6 +136,7 @@ wss.on("connection", (clientWs) => {
   });
 
   upstreamWs.on("error", (e) => {
+    upstreamOpen = false;
     clearInterval(pingInterval);
     console.log(`[BOOT ${BUILD}] [UPSTREAM] error`, e?.message || e);
     try {
@@ -120,9 +144,22 @@ wss.on("connection", (clientWs) => {
     } catch {}
   });
 
-  // Forward client -> upstream
+  // Client -> upstream (buffer until upstream is ready)
   clientWs.on("message", (data) => {
-    if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.send(data);
+    if (upstreamWs.readyState === WebSocket.OPEN) {
+      upstreamWs.send(data);
+      return;
+    }
+
+    // Buffer until upstream opens
+    if (queue.length < QUEUE_LIMIT) {
+      queue.push(data);
+    } else {
+      console.log(`[BOOT ${BUILD}] [QUEUE] overflow; closing client`);
+      try {
+        clientWs.close();
+      } catch {}
+    }
   });
 
   clientWs.on("close", () => {
