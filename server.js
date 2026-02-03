@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 10000;
 const UPSTREAM_WS_URL = process.env.UPSTREAM_WS_URL || "wss://chrome.browserless.io";
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 
-// Healthcheck HTTP server (Render requires this)
+// Render healthcheck
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "content-type": "text/plain" });
@@ -17,7 +17,7 @@ const server = http.createServer((req, res) => {
   res.end("ok");
 });
 
-// IMPORTANT: keep client-side compression OFF (Base44/browser side)
+// IMPORTANT: Base44/browser -> proxy (client side) compression OFF
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
@@ -32,22 +32,21 @@ function safeJson(obj) {
 }
 
 function buildUpstreamWsUrl() {
-  const upstream = new URL(UPSTREAM_WS_URL);
+  const u = new URL(UPSTREAM_WS_URL);
 
-  // Browserless typically wants token as query param
-  if (BROWSERLESS_TOKEN && !upstream.searchParams.get("token")) {
-    upstream.searchParams.set("token", BROWSERLESS_TOKEN);
+  // Browserless expects token as query param
+  if (BROWSERLESS_TOKEN && !u.searchParams.get("token")) {
+    u.searchParams.set("token", BROWSERLESS_TOKEN);
   }
 
-  // NOTE: Browserless usually works as:
-  // wss://chrome.browserless.io?token=XYZ (no trailing slash required)
-  // But keeping whatever you set in env is fine.
+  // IMPORTANT: avoid trailing "/"
+  // wss://chrome.browserless.io?token=...
+  if (u.pathname === "/") u.pathname = "";
 
-  return upstream.toString();
+  return u.toString();
 }
 
-// WebSocket upgrade handler
-server.on("upgrade", async (request, socket, head) => {
+server.on("upgrade", (request, socket, head) => {
   try {
     console.log("[UPGRADE] request.url =", request.url);
 
@@ -64,7 +63,7 @@ server.on("upgrade", async (request, socket, head) => {
       return;
     }
 
-    // ✅ OPTION A: skip verification entirely
+    // OPTION A: skip verification entirely
     console.log("[UPGRADE] verification skipped (OPTION A)");
 
     wss.handleUpgrade(request, socket, head, (clientWs) => {
@@ -77,19 +76,26 @@ server.on("upgrade", async (request, socket, head) => {
   }
 });
 
-wss.on("connection", (clientWs, request) => {
+wss.on("connection", (clientWs) => {
   console.log("[WS] client connected");
 
   const upstreamUrl = buildUpstreamWsUrl();
   console.log("[UPSTREAM] connecting to:", upstreamUrl);
 
   // ✅ KEY FIX:
-  // Browserless often uses permessage-deflate. Enable it HERE.
+  // Enable permessage-deflate explicitly for Browserless.
+  // This prevents RSV1 errors.
   const upstreamWs = new WebSocket(upstreamUrl, {
-    perMessageDeflate: true,
+    perMessageDeflate: {
+      threshold: 0,
+      clientNoContextTakeover: true,
+      serverNoContextTakeover: true,
+      clientMaxWindowBits: 15,
+      serverMaxWindowBits: 15,
+    },
+    maxPayload: 64 * 1024 * 1024,
   });
 
-  // Keepalive (helps some proxies)
   const pingInterval = setInterval(() => {
     try {
       if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.ping();
@@ -111,9 +117,7 @@ wss.on("connection", (clientWs, request) => {
     clearInterval(pingInterval);
     console.log("[UPSTREAM] closed", code, reason?.toString?.() || "");
     if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(
-        safeJson({ type: "proxy_error", message: "Upstream disconnected", code })
-      );
+      clientWs.send(safeJson({ type: "proxy_error", message: "Upstream disconnected", code }));
       clientWs.close();
     }
   });
@@ -123,16 +127,18 @@ wss.on("connection", (clientWs, request) => {
     console.log("[UPSTREAM] error", e?.message || e);
     if (clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(
-        safeJson({ type: "proxy_error", message: "Upstream error: " + (e?.message || "unknown") })
+        safeJson({
+          type: "proxy_error",
+          message: "Upstream error: " + (e?.message || "unknown"),
+        })
       );
       clientWs.close();
     }
   });
 
-  // Client -> Upstream
+  // Forward client -> upstream
   clientWs.on("message", (data) => {
-    if (upstreamWs.readyState !== WebSocket.OPEN) return;
-    upstreamWs.send(data);
+    if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.send(data);
   });
 
   clientWs.on("close", () => {
