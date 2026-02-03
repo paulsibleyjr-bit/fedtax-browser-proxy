@@ -1,95 +1,107 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
+/**
+ * Render expects an HTTP server to bind to PORT.
+ * WebSocket upgrades happen on this same server.
+ */
 const PORT = process.env.PORT || 10000;
 
-// Render/health checks
+// REQUIRED ENV (but we do NOT crash if missing)
+const BASE44_API_URL = process.env.BASE44_API_URL || "https://base44.app/api";
+const BASE44_APP_ID = process.env.BASE44_APP_ID; // should be set in Render env
+const UPSTREAM_WS_URL = process.env.UPSTREAM_WS_URL || "wss://chrome.browserless.io";
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
+
+// Healthcheck HTTP server (Render requires this)
 const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+    return;
+  }
+
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("ok");
 });
 
-// IMPORTANT: disable permessage-deflate to avoid RSV1 errors
+// Disable permessage-deflate to avoid RSV1/permessage-deflate issues
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
 });
 
-// ---- helpers ----
-function buildUpstreamUrl() {
-  const endpoint = process.env.BROWSERLESS_WS_ENDPOINT || process.env.UPSTREAM_WS_URL || "";
-  const token = process.env.BROWSERLESS_TOKEN || "";
-  if (!endpoint) return null;
-
-  // If they already gave a full tokenized URL, use it as-is
-  if (endpoint.includes("token=")) return endpoint;
-
-  if (!token) return endpoint;
-
-  // Append token safely
-  const hasQuery = endpoint.includes("?");
-  const sep = hasQuery ? "&" : "?";
-  return `${endpoint}${sep}token=${encodeURIComponent(token)}`;
+function safeLog(obj) {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return String(obj);
+  }
 }
 
-function getSessionCredsFromRequest(request) {
-  // 1) From query params
-  const url = new URL(request.url || "/", "http://localhost");
-  let sessionId = url.searchParams.get("sessionId") || "";
-  let proxySecret = url.searchParams.get("proxySecret") || "";
-
-  // 2) Fallback: some platforms strip WS query params — allow headers too
-  if (!sessionId) sessionId = request.headers["x-session-id"] || "";
-  if (!proxySecret) proxySecret = request.headers["x-proxy-secret"] || "";
-
-  return { sessionId, proxySecret, urlString: url.toString() };
+function buildVerifyUrl() {
+  // Base44 functions endpoint
+  // Example: https://base44.app/api/apps/<APP_ID>/functions/verifyBrowserSession
+  if (!BASE44_APP_ID) return null;
+  return `${BASE44_API_URL}/apps/${BASE44_APP_ID}/functions/verifyBrowserSession`;
 }
 
-async function verifyWithBase44(sessionId, proxySecret) {
-  // Use env if you set it; otherwise default to base44.app
-  const appId = process.env.BASE44_APP_ID;
-  const baseApi =
-    (process.env.BASE44_API_URL || "https://base44.app/api").replace(/\/$/, "");
-
-  if (!appId) {
-    throw new Error("Missing BASE44_APP_ID env var on Render");
+async function verifySession({ sessionId, proxySecret }) {
+  const verifyUrl = buildVerifyUrl();
+  if (!verifyUrl) {
+    return { ok: false, error: "Missing BASE44_APP_ID env var on Render." };
   }
 
-  const verifyUrl = `${baseApi}/apps/${appId}/functions/verifyBrowserSession`;
-
-  // IMPORTANT:
-  // We send BOTH query params AND JSON body for maximum compatibility
-  const withQuery = `${verifyUrl}?sessionId=${encodeURIComponent(
-    sessionId
-  )}&proxySecret=${encodeURIComponent(proxySecret)}`;
-
-  const res = await fetch(withQuery, {
+  const resp = await fetch(verifyUrl, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      // Optional shared secret if you add it to verifyBrowserSession (recommended)
-      ...(process.env.PROXY_VERIFY_KEY
-        ? { "x-proxy-verify-key": process.env.PROXY_VERIFY_KEY }
-        : {}),
-    },
+    headers: { "Content-Type": "application/json" },
+    // IMPORTANT: Send JSON body (do not rely on query params)
     body: JSON.stringify({ sessionId, proxySecret }),
   });
 
-  const text = await res.text();
-  return { ok: res.ok, status: res.status, text };
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    return { ok: false, error: text || `verifyBrowserSession failed (${resp.status})` };
+  }
+
+  // verifyBrowserSession may return JSON or text; we don’t strictly need it
+  const dataText = await resp.text().catch(() => "");
+  return { ok: true, dataText };
 }
 
-// ---- WS upgrade ----
+function buildUpstreamWsUrl({ originalRequestUrl }) {
+  // Your upstream should usually be Browserless.
+  // Many Browserless setups expect token via query param: ?token=XXX
+  // If you have a different Browserless endpoint (e.g. wss://YOUR_ENDPOINT),
+  // set UPSTREAM_WS_URL accordingly in Render.
+
+  // If upstream is missing token, we still allow WS but will report error on connect attempt.
+  if (!UPSTREAM_WS_URL) return null;
+
+  // Preserve any existing path or query from UPSTREAM_WS_URL,
+  // and append token if needed.
+  const upstream = new URL(UPSTREAM_WS_URL);
+
+  // If token is required and not already present, add it.
+  if (BROWSERLESS_TOKEN && !upstream.searchParams.get("token")) {
+    upstream.searchParams.set("token", BROWSERLESS_TOKEN);
+  }
+
+  return upstream.toString();
+}
+
 server.on("upgrade", async (request, socket, head) => {
   try {
-    console.log("\n[UPGRADE] request.url =", request.url);
-    console.log("[UPGRADE] host =", request.headers.host);
-    console.log("[UPGRADE] origin =", request.headers.origin);
+    // Log what we receive
+    console.log("[UPGRADE] request.url =", request.url);
 
-    const { sessionId, proxySecret, urlString } = getSessionCredsFromRequest(request);
+    // Parse query params from the websocket URL the browser used:
+    // wss://fedtax-browser-proxy.onrender.com/?sessionId=...&proxySecret=...
+    const url = new URL(request.url, "http://localhost");
+    const sessionId = url.searchParams.get("sessionId");
+    const proxySecret = url.searchParams.get("proxySecret");
 
-    console.log("[UPGRADE] parsed url =", urlString);
-    console.log("[UPGRADE] sessionId =", sessionId ? sessionId.slice(0, 12) + "..." : "(missing)");
+    console.log("[UPGRADE] sessionId present =", Boolean(sessionId));
     console.log("[UPGRADE] proxySecret present =", Boolean(proxySecret));
 
     if (!sessionId || !proxySecret) {
@@ -98,83 +110,142 @@ server.on("upgrade", async (request, socket, head) => {
       return;
     }
 
-    // 1) Verify session with Base44
-    const verify = await verifyWithBase44(sessionId, proxySecret);
+    // Verify session against Base44
+    const verify = await verifySession({ sessionId, proxySecret });
     if (!verify.ok) {
-      console.log("[UPGRADE] verify FAILED status:", verify.status);
-      console.log("[UPGRADE] verify body:", verify.text.slice(0, 500));
-      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n" + verify.text);
+      console.log("[UPGRADE] verify failed:", verify.error);
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n" + verify.error);
       socket.destroy();
       return;
     }
 
     console.log("[UPGRADE] verify OK");
 
-    // Upgrade accepted
+    // Accept the WS upgrade
     wss.handleUpgrade(request, socket, head, (clientWs) => {
       wss.emit("connection", clientWs, request);
     });
   } catch (err) {
-    console.error("[UPGRADE] error:", err);
+    console.error("[UPGRADE] error:", err?.message || err);
     socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\nUpgrade error");
     socket.destroy();
   }
 });
 
-// ---- Connection: pipe client <-> browserless ----
-wss.on("connection", (clientWs) => {
+wss.on("connection", (clientWs, request) => {
   console.log("[WS] client connected");
 
-  const upstreamUrl = buildUpstreamUrl();
+  // We connect to upstream on demand.
+  let upstreamWs = null;
+  let upstreamReady = false;
 
+  const upstreamUrl = buildUpstreamWsUrl({ originalRequestUrl: request?.url });
+
+  // If upstream config is missing, we keep the client alive but explain the issue.
   if (!upstreamUrl) {
-    console.log("[WS] Missing BROWSERLESS_WS_ENDPOINT/UPSTREAM_WS_URL env var");
-    clientWs.close(1011, "Missing upstream");
-    return;
+    clientWs.send(
+      safeLog({
+        type: "proxy_error",
+        message: "UPSTREAM_WS_URL is not set. Proxy verified session but cannot connect upstream.",
+      })
+    );
   }
 
-  console.log("[WS] connecting upstream:", upstreamUrl.replace(/token=[^&]+/, "token=***"));
+  // Attempt upstream connection if we have a URL
+  if (upstreamUrl) {
+    console.log("[UPSTREAM] connecting to:", upstreamUrl);
 
-  const upstreamWs = new WebSocket(upstreamUrl, {
-    perMessageDeflate: false,
-  });
-
-  // If upstream opens, start piping
-  upstreamWs.on("open", () => {
-    console.log("[WS] upstream connected");
-
-    // pipe client -> upstream
-    clientWs.on("message", (msg) => {
-      if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.send(msg);
+    upstreamWs = new WebSocket(upstreamUrl, {
+      perMessageDeflate: false,
     });
 
-    // pipe upstream -> client
-    upstreamWs.on("message", (msg) => {
-      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(msg);
+    upstreamWs.on("open", () => {
+      upstreamReady = true;
+      console.log("[UPSTREAM] connected");
+      clientWs.send(safeLog({ type: "proxy_status", message: "Upstream connected" }));
     });
-  });
 
-  upstreamWs.on("close", (code, reason) => {
-    console.log("[WS] upstream closed", code, reason?.toString?.() || "");
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1011, "Upstream closed");
-  });
+    upstreamWs.on("message", (data) => {
+      // Forward upstream -> client
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(data);
+      }
+    });
 
-  upstreamWs.on("error", (e) => {
-    console.log("[WS] upstream error", e?.message || e);
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1011, "Upstream error");
+    upstreamWs.on("close", (code, reason) => {
+      upstreamReady = false;
+      console.log("[UPSTREAM] closed", code, reason?.toString?.() || "");
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          safeLog({
+            type: "proxy_error",
+            message: "Upstream disconnected",
+            code,
+          })
+        );
+      }
+    });
+
+    upstreamWs.on("error", (e) => {
+      upstreamReady = false;
+      console.log("[UPSTREAM] error", e?.message || e);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          safeLog({
+            type: "proxy_error",
+            message: "Upstream connection error: " + (e?.message || "unknown"),
+          })
+        );
+      }
+    });
+  }
+
+  // Forward client -> upstream
+  clientWs.on("message", (data) => {
+    if (!upstreamWs || upstreamWs.readyState !== WebSocket.OPEN) {
+      // Don’t crash — just tell client upstream isn’t ready
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          safeLog({
+            type: "proxy_error",
+            message: upstreamUrl
+              ? "Upstream not ready yet. Try again in a moment."
+              : "Upstream URL missing. Check Render env vars.",
+          })
+        );
+      }
+      return;
+    }
+
+    upstreamWs.send(data);
   });
 
   clientWs.on("close", () => {
     console.log("[WS] client closed");
-    if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close(1000, "Client closed");
+    try {
+      if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close();
+    } catch {}
   });
 
   clientWs.on("error", (e) => {
     console.log("[WS] client error", e?.message || e);
-    if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close(1011, "Client error");
+    try {
+      if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close();
+    } catch {}
   });
 });
 
 server.listen(PORT, () => {
   console.log("Proxy listening on", PORT);
+
+  // IMPORTANT: DO NOT EXIT IF MISSING ENV VARS
+  if (!BASE44_APP_ID) {
+    console.warn("[BOOT] BASE44_APP_ID is missing — verifyBrowserSession will fail until set.");
+  }
+  if (!process.env.UPSTREAM_WS_URL) {
+    console.warn("[BOOT] UPSTREAM_WS_URL not set — defaulting to wss://chrome.browserless.io");
+  }
+  if (!BROWSERLESS_TOKEN) {
+    console.warn("[BOOT] BROWSERLESS_TOKEN missing — upstream may reject connections if token is required.");
+  }
 });
