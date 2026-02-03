@@ -1,14 +1,18 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
+/**
+ * Render expects an HTTP server to bind to PORT.
+ * WebSocket upgrades happen on this same server.
+ */
 const PORT = process.env.PORT || 10000;
 
 // ENV
 const BASE44_API_URL = process.env.BASE44_API_URL || "https://base44.app/api";
-const BASE44_APP_ID = process.env.BASE44_APP_ID;
-const PROXY_VERIFY_KEY = process.env.PROXY_VERIFY_KEY; // ✅ you added this in Render
+const BASE44_APP_ID = process.env.BASE44_APP_ID; // required
 const UPSTREAM_WS_URL = process.env.UPSTREAM_WS_URL || "wss://chrome.browserless.io";
-const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN; // usually required
+const PROXY_VERIFY_KEY = process.env.PROXY_VERIFY_KEY; // must match Base44 secret
 
 // Healthcheck HTTP server (Render requires this)
 const server = http.createServer((req, res) => {
@@ -21,13 +25,22 @@ const server = http.createServer((req, res) => {
   res.end("ok");
 });
 
-// Disable permessage-deflate to avoid RSV1 issues
+// Disable permessage-deflate to avoid RSV1/permessage-deflate issues
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
 });
 
+function safeLog(obj) {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return String(obj);
+  }
+}
+
 function buildVerifyUrl() {
+  // Example: https://base44.app/api/apps/<APP_ID>/functions/verifyBrowserSession
   if (!BASE44_APP_ID) return null;
   return `${BASE44_API_URL}/apps/${BASE44_APP_ID}/functions/verifyBrowserSession`;
 }
@@ -38,17 +51,19 @@ async function verifySession({ sessionId, proxySecret }) {
     return { ok: false, error: "Missing BASE44_APP_ID env var on Render." };
   }
 
-  // ✅ Hard timeout so upgrade doesn't hang
+  // Timeout so the upgrade never hangs forever
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 7000);
 
   try {
-    const headers = { "Content-Type": "application/json" };
+    const headers = {
+      "Content-Type": "application/json",
+    };
 
-    // ✅ If Base44 is checking a header secret, send it
-    // (Safe even if Base44 doesn't require it.)
+    // Send key in 2 common forms so Base44 can’t miss it
     if (PROXY_VERIFY_KEY) {
       headers["x-proxy-verify-key"] = PROXY_VERIFY_KEY;
+      headers["authorization"] = `Bearer ${PROXY_VERIFY_KEY}`;
     }
 
     const resp = await fetch(verifyUrl, {
@@ -63,10 +78,12 @@ async function verifySession({ sessionId, proxySecret }) {
       return { ok: false, error: text || `verifyBrowserSession failed (${resp.status})` };
     }
 
-    // We don't need to parse; success is enough
     return { ok: true };
   } catch (e) {
-    const msg = e?.name === "AbortError" ? "verifyBrowserSession timed out" : (e?.message || String(e));
+    const msg =
+      e?.name === "AbortError"
+        ? "verifyBrowserSession timed out"
+        : (e?.message || String(e));
     return { ok: false, error: msg };
   } finally {
     clearTimeout(t);
@@ -78,7 +95,7 @@ function buildUpstreamWsUrl() {
 
   const upstream = new URL(UPSTREAM_WS_URL);
 
-  // ✅ Add token if needed
+  // Add token if you have it and it’s not already set
   if (BROWSERLESS_TOKEN && !upstream.searchParams.get("token")) {
     upstream.searchParams.set("token", BROWSERLESS_TOKEN);
   }
@@ -90,6 +107,8 @@ server.on("upgrade", async (request, socket, head) => {
   try {
     console.log("[UPGRADE] request.url =", request.url);
 
+    // Parse query params from the websocket URL the browser used:
+    // wss://fedtax-browser-proxy.onrender.com/?sessionId=...&proxySecret=...
     const url = new URL(request.url, "http://localhost");
     const sessionId = url.searchParams.get("sessionId");
     const proxySecret = url.searchParams.get("proxySecret");
@@ -103,6 +122,7 @@ server.on("upgrade", async (request, socket, head) => {
       return;
     }
 
+    // Verify session against Base44
     const verify = await verifySession({ sessionId, proxySecret });
     if (!verify.ok) {
       console.log("[UPGRADE] verify failed:", verify.error);
@@ -113,6 +133,7 @@ server.on("upgrade", async (request, socket, head) => {
 
     console.log("[UPGRADE] verify OK");
 
+    // Accept WS upgrade
     wss.handleUpgrade(request, socket, head, (clientWs) => {
       wss.emit("connection", clientWs, request);
     });
@@ -123,57 +144,80 @@ server.on("upgrade", async (request, socket, head) => {
   }
 });
 
-wss.on("connection", (clientWs) => {
+wss.on("connection", (clientWs, request) => {
   console.log("[WS] client connected");
+
+  let upstreamWs = null;
 
   const upstreamUrl = buildUpstreamWsUrl();
   if (!upstreamUrl) {
-    console.log("[WS] missing UPSTREAM_WS_URL");
-    try { clientWs.close(1011, "Missing UPSTREAM_WS_URL"); } catch {}
-    return;
+    clientWs.send(
+      safeLog({
+        type: "proxy_error",
+        message: "UPSTREAM_WS_URL is not set. Proxy verified session but cannot connect upstream.",
+      })
+    );
   }
 
-  console.log("[UPSTREAM] connecting to:", upstreamUrl);
+  if (upstreamUrl) {
+    console.log("[UPSTREAM] connecting to:", upstreamUrl);
 
-  const upstreamWs = new WebSocket(upstreamUrl, { perMessageDeflate: false });
+    upstreamWs = new WebSocket(upstreamUrl, {
+      perMessageDeflate: false,
+    });
 
-  // ✅ Buffer messages until upstream is ready (NO injecting our own messages)
-  const buffer = [];
-  let upstreamOpen = false;
+    upstreamWs.on("open", () => {
+      console.log("[UPSTREAM] connected");
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(safeLog({ type: "proxy_status", message: "Upstream connected" }));
+      }
+    });
 
-  upstreamWs.on("open", () => {
-    upstreamOpen = true;
-    console.log("[UPSTREAM] connected");
+    upstreamWs.on("message", (data) => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(data);
+      }
+    });
 
-    // Flush buffered client messages
-    for (const msg of buffer) {
-      try { upstreamWs.send(msg); } catch {}
-    }
-    buffer.length = 0;
-  });
+    upstreamWs.on("close", (code, reason) => {
+      console.log("[UPSTREAM] closed", code, reason?.toString?.() || "");
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          safeLog({
+            type: "proxy_error",
+            message: "Upstream disconnected",
+            code,
+          })
+        );
+      }
+    });
 
-  upstreamWs.on("message", (data) => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(data);
-    }
-  });
+    upstreamWs.on("error", (e) => {
+      console.log("[UPSTREAM] error", e?.message || e);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          safeLog({
+            type: "proxy_error",
+            message: "Upstream connection error: " + (e?.message || "unknown"),
+          })
+        );
+      }
+    });
+  }
 
-  upstreamWs.on("close", (code, reason) => {
-    console.log("[UPSTREAM] closed", code, reason?.toString?.() || "");
-    try { clientWs.close(1011, "Upstream closed"); } catch {}
-  });
-
-  upstreamWs.on("error", (e) => {
-    console.log("[UPSTREAM] error", e?.message || e);
-    try { clientWs.close(1011, "Upstream error"); } catch {}
-  });
-
+  // Forward client -> upstream
   clientWs.on("message", (data) => {
-    // If upstream not ready yet, buffer briefly instead of sending garbage to the client
-    if (!upstreamOpen || upstreamWs.readyState !== WebSocket.OPEN) {
-      buffer.push(data);
-      // Prevent infinite memory growth
-      if (buffer.length > 200) buffer.shift();
+    if (!upstreamWs || upstreamWs.readyState !== WebSocket.OPEN) {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          safeLog({
+            type: "proxy_error",
+            message: upstreamUrl
+              ? "Upstream not ready yet. Try again in a moment."
+              : "Upstream URL missing. Check Render env vars.",
+          })
+        );
+      }
       return;
     }
     upstreamWs.send(data);
@@ -181,19 +225,23 @@ wss.on("connection", (clientWs) => {
 
   clientWs.on("close", () => {
     console.log("[WS] client closed");
-    try { upstreamWs.close(); } catch {}
+    try {
+      if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close();
+    } catch {}
   });
 
   clientWs.on("error", (e) => {
     console.log("[WS] client error", e?.message || e);
-    try { upstreamWs.close(); } catch {}
+    try {
+      if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close();
+    } catch {}
   });
 });
 
 server.listen(PORT, () => {
   console.log("Proxy listening on", PORT);
 
-  if (!BASE44_APP_ID) console.warn("[BOOT] BASE44_APP_ID missing.");
-  if (!PROXY_VERIFY_KEY) console.warn("[BOOT] PROXY_VERIFY_KEY missing (may be required by Base44 verify).");
-  if (!BROWSERLESS_TOKEN) console.warn("[BOOT] BROWSERLESS_TOKEN missing (upstream may reject).");
+  if (!BASE44_APP_ID) console.warn("[BOOT] BASE44_APP_ID is missing — verification will fail.");
+  if (!PROXY_VERIFY_KEY) console.warn("[BOOT] PROXY_VERIFY_KEY is missing — Base44 will reject proxy.");
+  if (!BROWSERLESS_TOKEN) console.warn("[BOOT] BROWSERLESS_TOKEN missing — upstream may reject connections.");
 });
