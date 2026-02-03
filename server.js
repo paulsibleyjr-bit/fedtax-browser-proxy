@@ -17,12 +17,13 @@ const server = http.createServer((req, res) => {
   res.end("ok");
 });
 
+// IMPORTANT: keep client-side compression OFF (Base44/browser side)
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
 });
 
-function safeLog(obj) {
+function safeJson(obj) {
   try {
     return JSON.stringify(obj);
   } catch {
@@ -31,18 +32,21 @@ function safeLog(obj) {
 }
 
 function buildUpstreamWsUrl() {
-  if (!UPSTREAM_WS_URL) return null;
-
   const upstream = new URL(UPSTREAM_WS_URL);
 
-  // Add token if missing
+  // Browserless typically wants token as query param
   if (BROWSERLESS_TOKEN && !upstream.searchParams.get("token")) {
     upstream.searchParams.set("token", BROWSERLESS_TOKEN);
   }
 
+  // NOTE: Browserless usually works as:
+  // wss://chrome.browserless.io?token=XYZ (no trailing slash required)
+  // But keeping whatever you set in env is fine.
+
   return upstream.toString();
 }
 
+// WebSocket upgrade handler
 server.on("upgrade", async (request, socket, head) => {
   try {
     console.log("[UPGRADE] request.url =", request.url);
@@ -60,7 +64,7 @@ server.on("upgrade", async (request, socket, head) => {
       return;
     }
 
-    // ✅ OPTION A: Skip verification for now
+    // ✅ OPTION A: skip verification entirely
     console.log("[UPGRADE] verification skipped (OPTION A)");
 
     wss.handleUpgrade(request, socket, head, (clientWs) => {
@@ -73,96 +77,84 @@ server.on("upgrade", async (request, socket, head) => {
   }
 });
 
-wss.on("connection", (clientWs) => {
+wss.on("connection", (clientWs, request) => {
   console.log("[WS] client connected");
 
-  let upstreamWs = null;
   const upstreamUrl = buildUpstreamWsUrl();
+  console.log("[UPSTREAM] connecting to:", upstreamUrl);
 
-  if (!upstreamUrl) {
-    clientWs.send(
-      safeLog({
-        type: "proxy_error",
-        message: "UPSTREAM_WS_URL is not set. Proxy connected but cannot connect upstream.",
-      })
-    );
-  }
+  // ✅ KEY FIX:
+  // Browserless often uses permessage-deflate. Enable it HERE.
+  const upstreamWs = new WebSocket(upstreamUrl, {
+    perMessageDeflate: true,
+  });
 
-  if (upstreamUrl) {
-    console.log("[UPSTREAM] connecting to:", upstreamUrl);
+  // Keepalive (helps some proxies)
+  const pingInterval = setInterval(() => {
+    try {
+      if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.ping();
+    } catch {}
+  }, 25000);
 
-    upstreamWs = new WebSocket(upstreamUrl, { perMessageDeflate: false });
-
-    upstreamWs.on("open", () => {
-      console.log("[UPSTREAM] connected");
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(safeLog({ type: "proxy_status", message: "Upstream connected" }));
-      }
-    });
-
-    upstreamWs.on("message", (data) => {
-      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
-    });
-
-    upstreamWs.on("close", (code, reason) => {
-      console.log("[UPSTREAM] closed", code, reason?.toString?.() || "");
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(safeLog({ type: "proxy_error", message: "Upstream disconnected", code }));
-      }
-    });
-
-    upstreamWs.on("error", (e) => {
-      console.log("[UPSTREAM] error", e?.message || e);
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(
-          safeLog({
-            type: "proxy_error",
-            message: "Upstream connection error: " + (e?.message || "unknown"),
-          })
-        );
-      }
-    });
-  }
-
-  clientWs.on("message", (data) => {
-    if (!upstreamWs || upstreamWs.readyState !== WebSocket.OPEN) {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(
-          safeLog({
-            type: "proxy_error",
-            message: upstreamUrl
-              ? "Upstream not ready yet. Try again in a moment."
-              : "Upstream URL missing. Check Render env vars.",
-          })
-        );
-      }
-      return;
+  upstreamWs.on("open", () => {
+    console.log("[UPSTREAM] connected");
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(safeJson({ type: "proxy_status", message: "Upstream connected" }));
     }
+  });
+
+  upstreamWs.on("message", (data) => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
+  });
+
+  upstreamWs.on("close", (code, reason) => {
+    clearInterval(pingInterval);
+    console.log("[UPSTREAM] closed", code, reason?.toString?.() || "");
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(
+        safeJson({ type: "proxy_error", message: "Upstream disconnected", code })
+      );
+      clientWs.close();
+    }
+  });
+
+  upstreamWs.on("error", (e) => {
+    clearInterval(pingInterval);
+    console.log("[UPSTREAM] error", e?.message || e);
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(
+        safeJson({ type: "proxy_error", message: "Upstream error: " + (e?.message || "unknown") })
+      );
+      clientWs.close();
+    }
+  });
+
+  // Client -> Upstream
+  clientWs.on("message", (data) => {
+    if (upstreamWs.readyState !== WebSocket.OPEN) return;
     upstreamWs.send(data);
   });
 
   clientWs.on("close", () => {
     console.log("[WS] client closed");
+    clearInterval(pingInterval);
     try {
-      if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close();
+      upstreamWs.close();
     } catch {}
   });
 
   clientWs.on("error", (e) => {
     console.log("[WS] client error", e?.message || e);
+    clearInterval(pingInterval);
     try {
-      if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close();
+      upstreamWs.close();
     } catch {}
   });
 });
 
 server.listen(PORT, () => {
   console.log("Proxy listening on", PORT);
-
-  if (!process.env.UPSTREAM_WS_URL) {
-    console.warn("[BOOT] UPSTREAM_WS_URL not set — defaulting to wss://chrome.browserless.io");
-  }
   if (!BROWSERLESS_TOKEN) {
-    console.warn("[BOOT] BROWSERLESS_TOKEN missing — upstream may reject connections if token is required.");
+    console.warn("[BOOT] BROWSERLESS_TOKEN missing — Browserless may reject connections.");
   }
 });
