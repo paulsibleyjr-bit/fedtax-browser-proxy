@@ -9,7 +9,6 @@ server.on('connection', async (clientWs) => {
   console.log('[CLIENT] New connection from Base44');
 
   try {
-    // Fetch fresh CDP endpoint from Browserless
     const browserlessToken = process.env.BROWSERLESS_TOKEN;
     if (!browserlessToken) {
       console.error('[ERROR] Missing BROWSERLESS_TOKEN');
@@ -36,7 +35,6 @@ server.on('connection', async (clientWs) => {
       return;
     }
 
-    // Force wss:// and add token query parameter
     let upstreamUrl = cdpWsUrl.replace(/^ws:\/\//, 'wss://');
     upstreamUrl += `?token=${browserlessToken}`;
     
@@ -59,16 +57,18 @@ server.on('connection', async (clientWs) => {
       clientWs.close(1011, 'upstream closed');
     });
 
-    // Bidirectional proxy
-    clientWs.on('message', (data) => {
+    // Bidirectional proxy - handle both text and binary
+    clientWs.on('message', (data, isBinary) => {
       if (upstreamWs.readyState === WebSocket.OPEN) {
-        upstreamWs.send(data);
+        upstreamWs.send(data, { binary: isBinary });
+        console.log('[C→U] Forwarded', isBinary ? 'binary' : 'text', 'message');
       }
     });
 
-    upstreamWs.on('message', (data) => {
+    upstreamWs.on('message', (data, isBinary) => {
       if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(data);
+        clientWs.send(data, { binary: isBinary });
+        console.log('[U→C] Forwarded', isBinary ? 'binary' : 'text', 'message');
       }
     });
 
