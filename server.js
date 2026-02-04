@@ -1,122 +1,75 @@
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
+import fetch from "node-fetch";
 
 const PORT = process.env.PORT || 10000;
 
-// Set these in Render env:
-const BROWSERLESS_HTTP = process.env.BROWSERLESS_HTTP || "https://chrome.browserless.io";
-const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN; // token only, no scheme
+const BROWSERLESS_HTTP = process.env.BROWSERLESS_HTTP; // https://chrome.browserless.io
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 
-function redact(url) {
-  if (!url) return url;
-  return url.replace(/token=([^&]+)/i, "token=REDACTED");
+if (!BROWSERLESS_HTTP || !BROWSERLESS_TOKEN) {
+  console.error("FATAL: Missing BROWSERLESS_HTTP or BROWSERLESS_TOKEN");
+  process.exit(1);
 }
 
-async function getCdpWsUrl() {
-  if (!BROWSERLESS_TOKEN) throw new Error("BROWSERLESS_TOKEN missing");
+async function getCDPWebSocket() {
+  const url = `${BROWSERLESS_HTTP}/json/version?token=${BROWSERLESS_TOKEN}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Browserless version fetch failed ${res.status}`);
+  const json = await res.json();
 
-  const base = BROWSERLESS_HTTP.replace(/\/$/, "");
-  const url = `${base}/json/version?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
-
-  const res = await fetch(url, { method: "GET" });
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Browserless /json/version failed ${res.status}: ${text.slice(0, 200)}`);
+  if (!json.webSocketDebuggerUrl) {
+    throw new Error("Browserless did not return webSocketDebuggerUrl");
   }
 
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`Browserless /json/version returned non-JSON: ${text.slice(0, 200)}`);
-  }
-
-  const ws = data.webSocketDebuggerUrl;
-  if (!ws) throw new Error("webSocketDebuggerUrl missing in /json/version response");
-
-  // Ensure WSS
-  let wsUrl = ws.replace(/^ws:\/\//i, "wss://");
-
-  // If token is not included, append it
-  if (!/token=/i.test(wsUrl)) {
-    wsUrl += (wsUrl.includes("?") ? "&" : "?") + `token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
-  }
-
-  return wsUrl;
+  return json.webSocketDebuggerUrl.replace(/^ws:/, "wss:");
 }
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { "content-type": "text/plain" });
+  res.writeHead(200);
   res.end("ok");
 });
 
 const wss = new WebSocketServer({ server, perMessageDeflate: false });
 
-wss.on("connection", async (client, req) => {
-  console.log("[WS] client connected", req.url || "/");
+wss.on("connection", async (client) => {
+  console.log("[WS] client connected");
 
-  let upstreamUrl;
+  let upstream;
   try {
-    upstreamUrl = await getCdpWsUrl();
-    console.log("[CFG] upstream CDP =", redact(upstreamUrl));
-  } catch (e) {
-    console.error("[CFG] failed to get CDP WS URL:", e?.message || e);
-    try { client.close(1011, "failed to get CDP websocket url"); } catch {}
+    const cdpUrl = await getCDPWebSocket();
+    console.log("[CFG] upstream CDP =", cdpUrl);
+
+    upstream = new WebSocket(cdpUrl, { perMessageDeflate: false });
+
+  } catch (err) {
+    console.error("[FATAL] CDP fetch failed", err.message);
+    client.close();
     return;
   }
 
-  const upstream = new WebSocket(upstreamUrl, { perMessageDeflate: false });
-
-  let closed = false;
-  const closeBoth = (code = 1000, reason = "") => {
-    if (closed) return;
-    closed = true;
-    try {
-      if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
-        client.close(code, reason);
-      }
-    } catch {}
-    try {
-      if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) {
-        upstream.close(code, reason);
-      }
-    } catch {}
-  };
-
   upstream.on("open", () => console.log("[UPSTREAM] open"));
+  upstream.on("close", (c, r) => console.log("[UPSTREAM] close", c, r?.toString()));
+  upstream.on("error", (e) => console.error("[UPSTREAM] error", e.message));
 
-  upstream.on("message", (data, isBinary) => {
-    const n = data?.length ?? data?.byteLength ?? 0;
-    console.log("[UP->WS] bytes", n, "binary?", isBinary);
-    if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
-  });
-
-  upstream.on("error", (err) => {
-    console.error("[UPSTREAM] error", err?.message || err);
-    closeBoth(1011, "upstream error");
-  });
-
-  upstream.on("close", (code, reason) => {
-    console.log("[UPSTREAM] close", code, reason?.toString?.() || "");
-    closeBoth(code, "upstream closed");
+  client.on("close", (c) => {
+    console.log("[WS] client close", c);
+    upstream?.close();
   });
 
   client.on("message", (data, isBinary) => {
-    const n = data?.length ?? data?.byteLength ?? 0;
-    console.log("[WS->UP] bytes", n, "binary?", isBinary);
-    if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
+    if (upstream.readyState === WebSocket.OPEN) {
+      upstream.send(data, { binary: isBinary });
+    }
   });
 
-  client.on("error", (err) => {
-    console.error("[WS] client error", err?.message || err);
-    closeBoth(1011, "client error");
-  });
-
-  client.on("close", (code, reason) => {
-    console.log("[WS] client close", code, reason?.toString?.() || "");
-    closeBoth(code, "client closed");
+  upstream.on("message", (data, isBinary) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(data, { binary: isBinary });
+    }
   });
 });
 
-server.listen(PORT, () => console.log("Proxy listening on", PORT));
+server.listen(PORT, () => {
+  console.log("Proxy listening on", PORT);
+});
