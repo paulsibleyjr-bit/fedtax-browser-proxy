@@ -1,7 +1,7 @@
-import WebSocket from 'ws';
+import { WebSocketServer } from 'ws';
 
 const PORT = process.env.PORT || 8080;
-const server = new WebSocket.Server({ port: PORT });
+const server = new WebSocketServer({ port: PORT });
 
 console.log(`[PROXY] Listening on port ${PORT}`);
 
@@ -40,6 +40,7 @@ server.on('connection', async (clientWs) => {
     const upstreamUrl = cdpWsUrl.replace(/^ws:\/\//, 'wss://');
     console.log('[CFG] Upstream CDP =', upstreamUrl.replace(/token=[^&]+/, 'token=REDACTED'));
 
+    const { default: WebSocket } = await import('ws');
     const upstreamWs = new WebSocket(upstreamUrl);
 
     upstreamWs.on('open', () => {
