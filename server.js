@@ -13,58 +13,68 @@ server.on('connection', async (clientWs) => {
   let pingInterval = null;
   const messageBuffer = [];
 
+  // Register message handler IMMEDIATELY (before async operations)
+  clientWs.on('message', (data, isBinary) => {
+    console.log('[C→] Received message from client, size=' + data.length);
+    if (upstreamWs && upstreamReady) {
+      upstreamWs.send(data, (err) => {
+        if (err) console.error('[C→U] Error:', err.message);
+        else console.log('[C→U] Forwarded');
+      });
+    } else {
+      messageBuffer.push(data);
+      console.log('[BUFFER] Queued, upstream ready=' + upstreamReady);
+    }
+  });
+
+  clientWs.on('close', () => {
+    console.log('[CLIENT] Disconnected');
+    if (pingInterval) clearInterval(pingInterval);
+    if (upstreamWs) upstreamWs.close();
+  });
+
   try {
     const browserlessToken = process.env.BROWSERLESS_TOKEN;
     if (!browserlessToken) {
       console.error('[ERROR] Missing BROWSERLESS_TOKEN');
-      clientWs.close(1011, 'Server misconfiguration');
+      clientWs.close(1011, 'No token');
       return;
     }
 
     const versionUrl = `https://chrome.browserless.io/json/version?token=${browserlessToken}`;
-    console.log('[CFG] Fetching CDP endpoint from Browserless...');
-
     const versionResp = await fetch(versionUrl);
     if (!versionResp.ok) {
-      console.error('[ERROR] Browserless API error:', versionResp.status);
-      clientWs.close(1011, 'Browserless auth failed');
+      clientWs.close(1011, 'Browserless error');
       return;
     }
 
     const versionData = await versionResp.json();
-    const cdpWsUrl = versionData.webSocketDebuggerUrl;
-
-    if (!cdpWsUrl) {
-      console.error('[ERROR] No webSocketDebuggerUrl in Browserless response');
-      clientWs.close(1011, 'Invalid Browserless response');
-      return;
-    }
-
-    let upstreamUrl = cdpWsUrl.replace(/^ws:\/\//, 'wss://');
+    let upstreamUrl = versionData.webSocketDebuggerUrl.replace(/^ws:\/\//, 'wss://');
     upstreamUrl += `?token=${browserlessToken}`;
-    
-    console.log('[CFG] Upstream CDP =', upstreamUrl.substring(0, 60) + '...');
 
     const { default: WebSocket } = await import('ws');
     upstreamWs = new WebSocket(upstreamUrl);
 
     upstreamWs.on('open', () => {
-      console.log('[UPSTREAM] Connected to Browserless');
+      console.log('[UPSTREAM] Connected');
       upstreamReady = true;
-      console.log('[STATUS] Ready to forward messages');
-      
+
       pingInterval = setInterval(() => {
-        if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) {
+        if (upstreamWs?.readyState === WebSocket.OPEN) {
           upstreamWs.ping();
-          console.log('[KEEPALIVE] Ping sent to Browserless');
         }
       }, 30000);
-      
+
       while (messageBuffer.length > 0) {
-        const data = messageBuffer.shift();
-        upstreamWs.send(data, (err) => {
-          if (err) console.error('[UPSTREAM] Send error:', err.message);
-          else console.log('[BUFFER] Flushed buffered message');
+        upstreamWs.send(messageBuffer.shift());
+      }
+    });
+
+    upstreamWs.on('message', (data) => {
+      if (clientWs.readyState === 1) {
+        clientWs.send(data, (err) => {
+          if (err) console.error('[U→C] Error:', err.message);
+          else console.log('[U→C] Forwarded');
         });
       }
     });
@@ -74,53 +84,12 @@ server.on('connection', async (clientWs) => {
       clientWs.close(1011, 'upstream error');
     });
 
-    upstreamWs.on('close', (code, reason) => {
-      console.log('[UPSTREAM] Closed:', code, reason?.toString() || 'no reason');
-      if (pingInterval) clearInterval(pingInterval);
+    upstreamWs.on('close', () => {
       clientWs.close(1011, 'upstream closed');
-    });
-
-    upstreamWs.on('pong', () => {
-      console.log('[KEEPALIVE] Pong received from Browserless');
-    });
-
-    clientWs.on('message', (data, isBinary) => {
-      console.log('[C→] Received message from client, size=' + data.length + ', binary=' + isBinary);
-      if (upstreamWs) {
-        if (upstreamReady) {
-          console.log('[C→U] Forwarding to upstream...');
-          upstreamWs.send(data, (err) => {
-            if (err) console.error('[C→U] Send error:', err.message);
-            else console.log('[C→U] Message forwarded successfully');
-          });
-        } else {
-          console.log('[BUFFER] Upstream not ready, buffering message');
-          messageBuffer.push(data);
-        }
-      } else {
-        console.error('[ERROR] upstreamWs is null!');
-      }
-    });
-
-    upstreamWs.on('message', (data, isBinary) => {
-      console.log('[U→] Received message from upstream, size=' + data.length + ', binary=' + isBinary);
-      if (clientWs.readyState === 1) {
-        console.log('[U→C] Forwarding to client...');
-        clientWs.send(data, (err) => {
-          if (err) console.error('[U→C] Send error:', err.message);
-          else console.log('[U→C] Message forwarded successfully');
-        });
-      }
-    });
-
-    clientWs.on('close', () => {
-      console.log('[CLIENT] Disconnected');
-      if (pingInterval) clearInterval(pingInterval);
-      if (upstreamWs) upstreamWs.close();
     });
 
   } catch (error) {
     console.error('[ERROR]', error.message);
-    clientWs.close(1011, 'proxy error');
+    clientWs.close(1011, 'error');
   }
 });
