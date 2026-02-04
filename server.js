@@ -1,10 +1,9 @@
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
-import fetch from "node-fetch";
 
 const PORT = process.env.PORT || 10000;
 
-const BROWSERLESS_HTTP = process.env.BROWSERLESS_HTTP; // https://chrome.browserless.io
+const BROWSERLESS_HTTP = process.env.BROWSERLESS_HTTP;
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 
 if (!BROWSERLESS_HTTP || !BROWSERLESS_TOKEN) {
@@ -13,13 +12,18 @@ if (!BROWSERLESS_HTTP || !BROWSERLESS_TOKEN) {
 }
 
 async function getCDPWebSocket() {
-  const url = `${BROWSERLESS_HTTP}/json/version?token=${BROWSERLESS_TOKEN}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Browserless version fetch failed ${res.status}`);
+  const res = await fetch(
+    `${BROWSERLESS_HTTP}/json/version?token=${BROWSERLESS_TOKEN}`
+  );
+
+  if (!res.ok) {
+    throw new Error(`Browserless version fetch failed ${res.status}`);
+  }
+
   const json = await res.json();
 
   if (!json.webSocketDebuggerUrl) {
-    throw new Error("Browserless did not return webSocketDebuggerUrl");
+    throw new Error("Missing webSocketDebuggerUrl from Browserless");
   }
 
   return json.webSocketDebuggerUrl.replace(/^ws:/, "wss:");
@@ -41,15 +45,14 @@ wss.on("connection", async (client) => {
     console.log("[CFG] upstream CDP =", cdpUrl);
 
     upstream = new WebSocket(cdpUrl, { perMessageDeflate: false });
-
   } catch (err) {
-    console.error("[FATAL] CDP fetch failed", err.message);
+    console.error("[FATAL] CDP fetch failed:", err.message);
     client.close();
     return;
   }
 
   upstream.on("open", () => console.log("[UPSTREAM] open"));
-  upstream.on("close", (c, r) => console.log("[UPSTREAM] close", c, r?.toString()));
+  upstream.on("close", (c) => console.log("[UPSTREAM] close", c));
   upstream.on("error", (e) => console.error("[UPSTREAM] error", e.message));
 
   client.on("close", (c) => {
