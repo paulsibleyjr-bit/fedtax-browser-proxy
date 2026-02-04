@@ -2,10 +2,17 @@ import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 10000;
+
+// IMPORTANT: Use BROWSERLESS_WS, but also print a redacted version for confirmation.
 const UPSTREAM = process.env.BROWSERLESS_WS;
 
 if (!UPSTREAM) {
   console.error("FATAL: BROWSERLESS_WS env var is missing");
+}
+
+function redact(url) {
+  if (!url) return url;
+  return url.replace(/token=([^&]+)/, "token=REDACTED");
 }
 
 const server = http.createServer((req, res) => {
@@ -13,55 +20,40 @@ const server = http.createServer((req, res) => {
   res.end("ok");
 });
 
-const wss = new WebSocketServer({
-  server,
-  perMessageDeflate: false,
-});
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
 
 wss.on("connection", (client, req) => {
   console.log("[WS] client connected", req.url);
+  console.log("[CFG] upstream =", redact(UPSTREAM));
 
-  const upstream = new WebSocket(UPSTREAM, {
-    perMessageDeflate: false,
-  });
+  const upstream = new WebSocket(UPSTREAM, { perMessageDeflate: false });
 
-  upstream.on("open", () => {
-    console.log("[UPSTREAM] connected");
-  });
+  upstream.on("open", () => console.log("[UPSTREAM] open"));
+  upstream.on("error", (err) => console.error("[UPSTREAM] error", err?.message || err));
+  upstream.on("close", (code, reason) =>
+    console.log("[UPSTREAM] close", code, reason?.toString?.() || "")
+  );
 
-  upstream.on("error", (err) => {
-    console.error("[UPSTREAM] error", err?.message || err);
-    try { client.close(1011, "upstream error"); } catch {}
-  });
+  client.on("error", (err) => console.error("[WS] client error", err?.message || err));
+  client.on("close", (code, reason) =>
+    console.log("[WS] client close", code, reason?.toString?.() || "")
+  );
 
-  upstream.on("close", (code, reason) => {
-    console.log("[UPSTREAM] closed", code, reason?.toString?.() || "");
-    try { client.close(code || 1011, reason?.toString?.() || "upstream closed"); } catch {}
-  });
-
+  // LOG + forward client -> upstream
   client.on("message", (data, isBinary) => {
-    if (upstream.readyState === WebSocket.OPEN) {
-      upstream.send(data, { binary: isBinary });
-    }
+    console.log("[WS->UP] bytes", data?.length || data?.byteLength || "?", "binary?", isBinary);
+    if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
   });
 
+  // LOG + forward upstream -> client
   upstream.on("message", (data, isBinary) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(data, { binary: isBinary });
-    }
+    console.log("[UP->WS] bytes", data?.length || data?.byteLength || "?", "binary?", isBinary);
+    if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
   });
 
-  client.on("close", (code, reason) => {
-    console.log("[WS] client closed", code, reason?.toString?.() || "");
-    try { upstream.close(code, reason); } catch {}
-  });
-
-  client.on("error", (err) => {
-    console.error("[WS] client error", err?.message || err);
-    try { upstream.close(); } catch {}
-  });
+  // teardown
+  client.on("close", () => { try { upstream.close(); } catch {} });
+  upstream.on("close", () => { try { client.close(); } catch {} });
 });
 
-server.listen(PORT, () => {
-  console.log("Proxy listening on", PORT);
-});
+server.listen(PORT, () => console.log("Proxy listening on", PORT));
