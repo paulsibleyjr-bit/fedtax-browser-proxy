@@ -10,6 +10,7 @@ server.on('connection', async (clientWs) => {
   
   let upstreamWs = null;
   let upstreamReady = false;
+  let pingInterval = null;
   const messageBuffer = [];
 
   try {
@@ -51,6 +52,14 @@ server.on('connection', async (clientWs) => {
       console.log('[UPSTREAM] Connected to Browserless');
       upstreamReady = true;
       
+      // Start keepalive ping every 30 seconds
+      pingInterval = setInterval(() => {
+        if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) {
+          upstreamWs.ping();
+          console.log('[KEEPALIVE] Ping sent to Browserless');
+        }
+      }, 30000);
+      
       // Flush buffered messages
       while (messageBuffer.length > 0) {
         const data = messageBuffer.shift();
@@ -67,7 +76,12 @@ server.on('connection', async (clientWs) => {
 
     upstreamWs.on('close', (code, reason) => {
       console.log('[UPSTREAM] Closed:', code, reason?.toString() || 'no reason');
+      if (pingInterval) clearInterval(pingInterval);
       clientWs.close(1011, 'upstream closed');
+    });
+
+    upstreamWs.on('pong', () => {
+      console.log('[KEEPALIVE] Pong received from Browserless');
     });
 
     // Client → Upstream
@@ -79,7 +93,6 @@ server.on('connection', async (clientWs) => {
             else console.log('[C→U] Message forwarded');
           });
         } else {
-          // Buffer until upstream ready
           messageBuffer.push(data);
           console.log('[BUFFER] Buffering message, upstream not ready yet');
         }
@@ -98,6 +111,7 @@ server.on('connection', async (clientWs) => {
 
     clientWs.on('close', () => {
       console.log('[CLIENT] Disconnected');
+      if (pingInterval) clearInterval(pingInterval);
       if (upstreamWs) upstreamWs.close();
     });
 
