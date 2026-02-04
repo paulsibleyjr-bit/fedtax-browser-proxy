@@ -36,8 +36,10 @@ server.on('connection', async (clientWs) => {
       return;
     }
 
-    // Force wss:// and connect
-    const upstreamUrl = cdpWsUrl.replace(/^ws:\/\//, 'wss://');
+    // Force wss:// and add token query parameter
+    let upstreamUrl = cdpWsUrl.replace(/^ws:\/\//, 'wss://');
+    upstreamUrl += `?token=${browserlessToken}`;
+    
     console.log('[CFG] Upstream CDP =', upstreamUrl.replace(/token=[^&]+/, 'token=REDACTED'));
 
     const { default: WebSocket } = await import('ws');
