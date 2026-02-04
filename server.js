@@ -7,6 +7,10 @@ console.log(`[PROXY] Listening on port ${PORT}`);
 
 server.on('connection', async (clientWs) => {
   console.log('[CLIENT] New connection from Base44');
+  
+  let upstreamWs = null;
+  let upstreamReady = false;
+  const messageBuffer = [];
 
   try {
     const browserlessToken = process.env.BROWSERLESS_TOKEN;
@@ -38,13 +42,22 @@ server.on('connection', async (clientWs) => {
     let upstreamUrl = cdpWsUrl.replace(/^ws:\/\//, 'wss://');
     upstreamUrl += `?token=${browserlessToken}`;
     
-    console.log('[CFG] Upstream CDP =', upstreamUrl.replace(/token=[^&]+/, 'token=REDACTED'));
+    console.log('[CFG] Upstream CDP =', upstreamUrl.substring(0, 60) + '...');
 
     const { default: WebSocket } = await import('ws');
-    const upstreamWs = new WebSocket(upstreamUrl);
+    upstreamWs = new WebSocket(upstreamUrl);
 
     upstreamWs.on('open', () => {
       console.log('[UPSTREAM] Connected to Browserless');
+      upstreamReady = true;
+      
+      // Flush buffered messages
+      while (messageBuffer.length > 0) {
+        const data = messageBuffer.shift();
+        upstreamWs.send(data, (err) => {
+          if (err) console.error('[UPSTREAM] Send error:', err.message);
+        });
+      }
     });
 
     upstreamWs.on('error', (err) => {
@@ -57,24 +70,35 @@ server.on('connection', async (clientWs) => {
       clientWs.close(1011, 'upstream closed');
     });
 
-    // Bidirectional proxy - handle both text and binary
-    clientWs.on('message', (data, isBinary) => {
-      if (upstreamWs.readyState === WebSocket.OPEN) {
-        upstreamWs.send(data, { binary: isBinary });
-        console.log('[C→U] Forwarded', isBinary ? 'binary' : 'text', 'message');
+    // Client → Upstream
+    clientWs.on('message', (data) => {
+      if (upstreamWs) {
+        if (upstreamReady) {
+          upstreamWs.send(data, (err) => {
+            if (err) console.error('[UPSTREAM] Send error:', err.message);
+            else console.log('[C→U] Message forwarded');
+          });
+        } else {
+          // Buffer until upstream ready
+          messageBuffer.push(data);
+          console.log('[BUFFER] Buffering message, upstream not ready yet');
+        }
       }
     });
 
-    upstreamWs.on('message', (data, isBinary) => {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(data, { binary: isBinary });
-        console.log('[U→C] Forwarded', isBinary ? 'binary' : 'text', 'message');
+    // Upstream → Client
+    upstreamWs.on('message', (data) => {
+      if (clientWs.readyState === 1) {
+        clientWs.send(data, (err) => {
+          if (err) console.error('[CLIENT] Send error:', err.message);
+          else console.log('[U→C] Message forwarded');
+        });
       }
     });
 
     clientWs.on('close', () => {
       console.log('[CLIENT] Disconnected');
-      upstreamWs.close();
+      if (upstreamWs) upstreamWs.close();
     });
 
   } catch (error) {
